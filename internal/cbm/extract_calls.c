@@ -1584,6 +1584,73 @@ static void extract_jsx_component_ref(CBMExtractCtx *ctx, TSNode node, const cha
     }
 }
 
+// Kotlin: `a OP b` desugars to an operator-method call `a.<method>(b)`. The
+// generic call walk keys on call_expression nodes and so never sees these
+// precedence-specific binary-expression nodes, leaving the type-aware LSP
+// operator resolution (lsp_kt_operator -> the user `operator fun`) with no call
+// site to attach to. Record a textual call to the operator method's bare name;
+// the operator-token -> method mapping mirrors kotlin_lsp.c's binary handler so
+// the names join. Builtin operands (Int+Int) resolve to a stdlib type with no
+// graph node and drop, exactly as before — only user `operator fun`s gain edges.
+static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                         const char *enclosing_func_qn) {
+    if (strcmp(kind, "binary_expression") != 0 && strcmp(kind, "additive_expression") != 0 &&
+        strcmp(kind, "multiplicative_expression") != 0 &&
+        strcmp(kind, "comparison_expression") != 0 && strcmp(kind, "equality_expression") != 0 &&
+        strcmp(kind, "range_expression") != 0) {
+        return;
+    }
+    uint32_t ncc = ts_node_named_child_count(node);
+    TSNode lhs = ts_node_child_by_field_name(node, TS_FIELD("left"));
+    TSNode rhs = ts_node_child_by_field_name(node, TS_FIELD("right"));
+    if (ts_node_is_null(lhs) && ncc >= 1) {
+        lhs = ts_node_named_child(node, 0);
+    }
+    if (ts_node_is_null(rhs) && ncc >= 2) {
+        rhs = ts_node_named_child(node, ncc - 1);
+    }
+    if (ts_node_is_null(lhs) || ts_node_is_null(rhs)) {
+        return;
+    }
+    uint32_t lhs_end = ts_node_end_byte(lhs);
+    uint32_t rhs_start = ts_node_start_byte(rhs);
+    if (rhs_start <= lhs_end) {
+        return;
+    }
+    const char *between = ctx->source + lhs_end;
+    size_t blen = (size_t)(rhs_start - lhs_end);
+    const char *op_method = NULL;
+    if (cbm_memmem(between, blen, "===", 3) || cbm_memmem(between, blen, "!==", 3)) {
+        return; // identity comparison: no operator method
+    } else if (cbm_memmem(between, blen, "==", 2) || cbm_memmem(between, blen, "!=", 2)) {
+        op_method = "equals";
+    } else if (cbm_memmem(between, blen, "..<", 3)) {
+        op_method = "rangeUntil";
+    } else if (cbm_memmem(between, blen, "..", 2)) {
+        op_method = "rangeTo";
+    } else if (cbm_memmem(between, blen, "<", 1) || cbm_memmem(between, blen, ">", 1)) {
+        op_method = "compareTo"; // covers <, >, <=, >=
+    } else if (cbm_memmem(between, blen, "+", 1)) {
+        op_method = "plus";
+    } else if (cbm_memmem(between, blen, "-", 1)) {
+        op_method = "minus";
+    } else if (cbm_memmem(between, blen, "*", 1)) {
+        op_method = "times";
+    } else if (cbm_memmem(between, blen, "/", 1)) {
+        op_method = "div";
+    } else if (cbm_memmem(between, blen, "%", 1)) {
+        op_method = "rem";
+    }
+    if (!op_method) {
+        return;
+    }
+    CBMCall call = {0};
+    call.callee_name = op_method;
+    call.enclosing_func_qn = enclosing_func_qn;
+    call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
+    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+}
+
 void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->call_node_types || !spec->call_node_types[0]) {
         return;
@@ -1642,5 +1709,9 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
 
     if (ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_JAVASCRIPT) {
         extract_jsx_component_ref(ctx, node, ts_node_type(node), state->enclosing_func_qn);
+    }
+
+    if (ctx->language == CBM_LANG_KOTLIN) {
+        extract_kotlin_operator_call(ctx, node, ts_node_type(node), state->enclosing_func_qn);
     }
 }
