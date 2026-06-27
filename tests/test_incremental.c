@@ -297,9 +297,20 @@ TEST(incr_full_index) {
         printf("    [PERF WARNING] full index: %.0fms (>30s)\n", ms);
     }
 
-    /* Memory: should not exceed 2GB for a 1100-file Python project */
+    /* Memory: should not exceed ~2GB for a 1100-file Python project. ARM (and
+     * other large-page) Linux/macOS use 16KB pages vs x86's 4KB; per-allocation
+     * page rounding inflates RSS ~25-30% for the SAME logical footprint (not a
+     * leak — x86 peaks ~1870MB, ARM ~2385MB on the same index). Scale the budget
+     * by page size so the guard still catches real runaway memory (a leak would
+     * be GBs over) without false-failing on large-page architectures. */
     size_t rss_delta_mb = peak_mb - (g_rss_before_full / (1024 * 1024));
-    ASSERT_LT((int)rss_delta_mb, 2048);
+    int rss_limit_mb = 2048;
+#ifndef _WIN32
+    if (sysconf(_SC_PAGESIZE) >= 16384) {
+        rss_limit_mb = 2816;
+    }
+#endif
+    ASSERT_LT((int)rss_delta_mb, rss_limit_mb);
 
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
            "in %.0fms, peak=%zuMB\n",
